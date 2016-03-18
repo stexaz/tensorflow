@@ -16,17 +16,16 @@
 from __future__ import absolute_import
 from __future__ import print_function
 
-import tensorflow.python.platform
-
 import collections
 import math
-import numpy as np
 import os
 import random
+import zipfile
+
+import numpy as np
 from six.moves import urllib
 from six.moves import xrange  # pylint: disable=redefined-builtin
 import tensorflow as tf
-import zipfile
 
 # Step 1: Download the data.
 url = 'http://mattmahoney.net/dc/'
@@ -49,10 +48,10 @@ filename = maybe_download('text8.zip', 31344016)
 
 # Read the data into a string.
 def read_data(filename):
-  f = zipfile.ZipFile(filename)
-  for name in f.namelist():
-    return f.read(name).split()
-  f.close()
+  """Extract the first file enclosed in a zip file as a list of words"""
+  with zipfile.ZipFile(filename) as f:
+    data = f.read(f.namelist()[0]).split()
+  return data
 
 words = read_data(filename)
 print('Data size', len(words))
@@ -129,7 +128,7 @@ num_skips = 2         # How many times to reuse an input to generate a label.
 # construction are also the most frequent.
 valid_size = 16     # Random set of words to evaluate similarity on.
 valid_window = 100  # Only pick dev samples in the head of the distribution.
-valid_examples = np.array(random.sample(np.arange(valid_window), valid_size))
+valid_examples = np.random.choice(valid_window, valid_size, replace=False)
 num_sampled = 64    # Number of negative examples to sample.
 
 graph = tf.Graph()

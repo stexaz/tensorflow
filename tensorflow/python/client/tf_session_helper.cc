@@ -1,4 +1,4 @@
-/* Copyright 2015 Google Inc. All Rights Reserved.
+/* Copyright 2016 Google Inc. All Rights Reserved.
 
 Licensed under the Apache License, Version 2.0 (the "License");
 you may not use this file except in compliance with the License.
@@ -22,6 +22,8 @@ limitations under the License.
 #include <cstring>
 
 #include "tensorflow/core/framework/allocator.h"
+#include "tensorflow/core/framework/log_memory.h"
+#include "tensorflow/core/framework/op_kernel.h"
 #include "tensorflow/core/graph/equal_graph_def.h"
 #include "tensorflow/core/lib/core/coding.h"
 #include "tensorflow/core/platform/types.h"
@@ -119,7 +121,10 @@ Status PyArray_TYPE_to_TF_DataType(PyArrayObject* array,
       *out_tf_datatype = TF_BOOL;
       break;
     case NPY_COMPLEX64:
-      *out_tf_datatype = TF_COMPLEX;
+      *out_tf_datatype = TF_COMPLEX64;
+      break;
+    case NPY_COMPLEX128:
+      *out_tf_datatype = TF_COMPLEX128;
       break;
     case NPY_OBJECT:
       *out_tf_datatype = TF_STRING;
@@ -166,8 +171,11 @@ Status TF_DataType_to_PyArray_TYPE(TF_DataType tf_datatype,
     case TF_BOOL:
       *out_pyarray_type = NPY_BOOL;
       break;
-    case TF_COMPLEX:
+    case TF_COMPLEX64:
       *out_pyarray_type = NPY_COMPLEX64;
+      break;
+    case TF_COMPLEX128:
+      *out_pyarray_type = NPY_COMPLEX128;
       break;
     case TF_STRING:
       *out_pyarray_type = NPY_OBJECT;
@@ -425,13 +433,12 @@ Safe_PyObjectPtr make_safe(PyObject* o) {
   return Safe_PyObjectPtr(o, Py_DECREF_wrapper);
 }
 
-// Wrapper for TF_Run that converts the arguments to appropriate types.
-// If *out_status is OK, the caller becomes the owner of the PyObjects
-// in *out_values.
-void TF_Run_wrapper(TF_Session* session, const FeedVector& inputs,
-                    const NameVector& output_names,
-                    const NameVector& target_nodes, Status* out_status,
-                    PyObjectVector* out_values) {
+void TF_Run_wrapper_helper(TF_Session* session, const char* handle,
+                           const TF_Buffer* run_options,
+                           const FeedVector& inputs,
+                           const NameVector& output_names,
+                           const NameVector& target_nodes, Status* out_status,
+                           PyObjectVector* out_values, TF_Buffer* run_outputs) {
   // 1. Convert the feed inputs to the appropriate form for TF_Run.
   NameVector input_names;
   Safe_PyObjectVector
@@ -476,13 +483,25 @@ void TF_Run_wrapper(TF_Session* session, const FeedVector& inputs,
       // requirements for tensorflow::Tensor. We hard code this here to
       // avoid taking a dependency on Eigen in the client code.
       void* data = tensorflow::cpu_allocator()->AllocateRaw(32, size);
+      if (tensorflow::LogMemory::IsEnabled()) {
+        LogMemory::RecordRawAllocation(
+            "Python session helper",
+            tensorflow::LogMemory::EXTERNAL_TENSOR_ALLOCATION_STEP_ID, size,
+            data, tensorflow::cpu_allocator());
+      }
       std::memcpy(data, PyArray_DATA(array), size);
-      inputs_safe.emplace_back(make_safe(
-          TF_NewTensor(dtype, dims.data(), dims.size(), data, size,
-                       [](void* data, size_t len, void* arg) {
-                         tensorflow::cpu_allocator()->DeallocateRaw(data);
-                       },
-                       nullptr)));
+      inputs_safe.emplace_back(make_safe(TF_NewTensor(
+          dtype, dims.data(), dims.size(), data, size,
+          [](void* data, size_t len, void* arg) {
+            if (tensorflow::LogMemory::IsEnabled()) {
+              LogMemory::RecordRawDeallocation(
+                  "Python session helper",
+                  tensorflow::LogMemory::EXTERNAL_TENSOR_ALLOCATION_STEP_ID,
+                  data, tensorflow::cpu_allocator(), false);
+            }
+            tensorflow::cpu_allocator()->DeallocateRaw(data);
+          },
+          nullptr)));
       // The destruction of the numpy array will now be handled by the
       // inputs_safe destructor.
       py_inputs_safe[i].reset();
@@ -514,10 +533,20 @@ void TF_Run_wrapper(TF_Session* session, const FeedVector& inputs,
 
   // 3. Actually call TF_Run().
   Py_BEGIN_ALLOW_THREADS;
-  TF_Run(session, input_names.data(), inputs_unsafe.data(), input_names.size(),
-         const_cast<const char**>(output_names.data()), outputs.data(),
-         output_names.size(), const_cast<const char**>(target_nodes.data()),
-         target_nodes.size(), status.get());
+  if (handle == nullptr) {
+    TF_Run(session, run_options, input_names.data(), inputs_unsafe.data(),
+           input_names.size(), const_cast<const char**>(output_names.data()),
+           outputs.data(), output_names.size(),
+           const_cast<const char**>(target_nodes.data()), target_nodes.size(),
+           run_outputs, status.get());
+  } else {
+    TF_PRun(session, handle, input_names.data(), inputs_unsafe.data(),
+            input_names.size(), const_cast<const char**>(output_names.data()),
+            outputs.data(), output_names.size(),
+            const_cast<const char**>(target_nodes.data()), target_nodes.size(),
+            status.get());
+  }
+
   Py_END_ALLOW_THREADS;
 
   // 4. The TensorFlow runtime has taken ownership of the fed tensors,
@@ -556,6 +585,49 @@ void TF_Run_wrapper(TF_Session* session, const FeedVector& inputs,
     out_values->push_back(output.release());
   }
   *out_status = Status::OK();
+}
+
+// Wrapper for TF_Run that converts the arguments to appropriate types.
+// If *out_status is OK, the caller becomes the owner of the PyObjects
+// in *out_values.
+void TF_Run_wrapper(TF_Session* session, const TF_Buffer* run_options,
+                    const FeedVector& inputs, const NameVector& output_names,
+                    const NameVector& target_nodes, Status* out_status,
+                    PyObjectVector* out_values, TF_Buffer* run_outputs) {
+  TF_Run_wrapper_helper(session, nullptr, run_options, inputs, output_names,
+                        target_nodes, out_status, out_values, run_outputs);
+}
+
+// Wrapper for TF_PRunSetup that converts the arguments to appropriate types.
+// If *out_status is OK, the caller becomes the owner of *out_handle.
+void TF_PRunSetup_wrapper(TF_Session* session, const NameVector& input_names,
+                          const NameVector& output_names,
+                          const NameVector& target_nodes, Status* out_status,
+                          char** out_handle) {
+  Safe_TF_StatusPtr status = make_safe(TF_NewStatus());
+  Py_BEGIN_ALLOW_THREADS;
+  TF_PRunSetup(
+      session, const_cast<const char**>(input_names.data()), input_names.size(),
+      const_cast<const char**>(output_names.data()), output_names.size(),
+      const_cast<const char**>(target_nodes.data()), target_nodes.size(),
+      out_handle, status.get());
+  Py_END_ALLOW_THREADS;
+
+  if (TF_GetCode(status.get()) != TF_OK) {
+    *out_status = TF_Status_to_Status(status.get());
+    return;
+  }
+  *out_status = Status::OK();
+}
+
+// Wrapper for TF_PRun that converts the arguments to appropriate types.
+// If *out_status is OK, the caller becomes the owner of the PyObjects
+// in *out_values.
+void TF_PRun_wrapper(TF_Session* session, const char* handle,
+                     const FeedVector& inputs, const NameVector& output_names,
+                     Status* out_status, PyObjectVector* out_values) {
+  TF_Run_wrapper_helper(session, handle, nullptr, inputs, output_names,
+                        NameVector(), out_status, out_values, nullptr);
 }
 
 void ImportNumpy() { import_array1(); }

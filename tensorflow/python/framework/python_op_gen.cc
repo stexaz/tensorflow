@@ -114,20 +114,6 @@ void AppendWithinWidth(string* dest, StringPiece append, int width) {
   }
 }
 
-void RemoveDescriptionsFromOpDef(OpDef* op_def) {
-  for (int i = 0; i < op_def->input_arg_size(); ++i) {
-    op_def->mutable_input_arg(i)->clear_description();
-  }
-  for (int i = 0; i < op_def->output_arg_size(); ++i) {
-    op_def->mutable_output_arg(i)->clear_description();
-  }
-  for (int i = 0; i < op_def->attr_size(); ++i) {
-    op_def->mutable_attr(i)->clear_description();
-  }
-  op_def->clear_summary();
-  op_def->clear_description();
-}
-
 // Like DataTypeString() but uses the Python names for the
 // float types.
 string PythonDataTypeString(DataType dtype) {
@@ -326,11 +312,6 @@ static string GetReturns(const OpDef& op_def,
     }
   }
   return result;
-}
-
-void PrintReturns(const OpDef& op_def,
-                  const std::vector<string>& output_type_string) {
-  printf("%s", GetReturns(op_def, output_type_string).c_str());
 }
 
 string StringToPython(const string& str) {
@@ -712,8 +693,8 @@ string GetAllPythonOps(const char* hidden, bool require_shapes) {
   return GetPythonOps(ops, hidden, require_shapes);
 }
 
-string GetPythonWrappers(const char* buf, size_t len) {
-  string op_list_str(buf, len);
+string GetPythonWrappers(const char* op_wrapper_buf, size_t op_wrapper_len) {
+  string op_list_str(op_wrapper_buf, op_wrapper_len);
   OpList ops;
   ops.ParseFromString(op_list_str);
   return GetPythonOps(ops, "", false);

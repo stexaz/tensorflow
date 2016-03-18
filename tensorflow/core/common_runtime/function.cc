@@ -20,11 +20,13 @@ limitations under the License.
 
 #include "tensorflow/core/common_runtime/device.h"
 #include "tensorflow/core/common_runtime/executor.h"
+#include "tensorflow/core/common_runtime/graph_optimizer.h"
 #include "tensorflow/core/framework/function.h"
 #include "tensorflow/core/framework/node_def_util.h"
 #include "tensorflow/core/framework/op.h"
 #include "tensorflow/core/framework/op_kernel.h"
 #include "tensorflow/core/graph/algorithm.h"
+#include "tensorflow/core/graph/gradients.h"
 #include "tensorflow/core/graph/graph_constructor.h"
 #include "tensorflow/core/graph/optimizer_cse.h"
 #include "tensorflow/core/lib/gtl/map_util.h"
@@ -125,62 +127,6 @@ static Node* AddRet(Graph* g, Endpoint input, int index) {
   return ret;
 }
 
-static Node* AddZerosLike(Graph* g, Endpoint input) {
-  DCHECK_LT(0, input.dtype());
-  DCHECK_LT(input.dtype(), DT_FLOAT_REF);
-  NodeDef ndef;
-  ndef.set_name(g->NewName(kNodeLabel));
-  ndef.set_op("ZerosLike");
-  ndef.add_input(input.name());
-  AddNodeAttr("T", input.dtype(), &ndef);
-  Status s;
-  Node* ret = g->AddNode(ndef, &s);
-  TF_CHECK_OK(s);
-  g->AddEdge(input.node, input.index, ret, 0);
-  return ret;
-}
-
-static Node* AddSymGrad(Graph* g, Node* n, gtl::ArraySlice<Endpoint> grads) {
-  const int num_x = n->num_inputs();
-  const int num_y = n->num_outputs();
-  CHECK_EQ(num_y, grads.size());
-
-  NodeDef ndef;
-  ndef.set_name(g->NewName(kNodeLabel));
-  ndef.set_op(kGradientOp);
-
-  // The gradient node should have num_x + num_y inputs.
-  std::vector<Endpoint> n_inputs(num_x);
-  for (const Edge* e : n->in_edges()) {
-    if (e->IsControlEdge()) continue;
-    n_inputs[e->dst_input()] = {e->src(), e->src_output()};
-  }
-  DataTypeVector in_types;
-  for (const Endpoint& ep : n_inputs) {
-    ndef.add_input(ep.name());
-    in_types.push_back(ep.dtype());
-  }
-  for (const Endpoint& ep : grads) {
-    ndef.add_input(ep.name());
-    in_types.push_back(ep.dtype());
-  }
-  CHECK_EQ(ndef.input_size(), num_x + num_y);
-
-  AddNodeAttr("Tin", in_types, &ndef);
-
-  // The gradient node's outputs have the same types as the node 'n's
-  // inputs.
-  AddNodeAttr("Tout", n->input_types(), &ndef);
-  NameAttrList func;
-  func.set_name(n->type_string());
-  *(func.mutable_attr()) = n->def().attr();
-  AddNodeAttr("f", func, &ndef);
-  Status s;
-  Node* ret = g->AddNode(ndef, &s);
-  TF_CHECK_OK(s);
-  return ret;
-}
-
 class ArgOp : public OpKernel {
  public:
   explicit ArgOp(OpKernelConstruction* ctx) : OpKernel(ctx) {
@@ -238,13 +184,32 @@ class RetvalOp : public OpKernel {
 REGISTER_KERNEL_BUILDER(Name("_Retval").Device(DEVICE_CPU), RetvalOp);
 REGISTER_KERNEL_BUILDER(Name("_Retval").Device(DEVICE_GPU), RetvalOp);
 
+class PassOn : public OpKernel {
+ public:
+  explicit PassOn(OpKernelConstruction* ctx) : OpKernel(ctx) {}
+
+  void Compute(OpKernelContext* ctx) override {
+    OP_REQUIRES(ctx, ctx->num_inputs() == ctx->num_outputs(),
+                errors::Internal("#inputs != #outputs : ", ctx->num_inputs(),
+                                 " vs. ", ctx->num_outputs()));
+    for (int i = 0; i < ctx->num_inputs(); ++i) {
+      ctx->set_output(i, ctx->input(i));
+    }
+  }
+};
+REGISTER_KERNEL_BUILDER(Name("_ListToArray").Device(DEVICE_CPU), PassOn);
+REGISTER_KERNEL_BUILDER(Name("_ListToArray").Device(DEVICE_GPU), PassOn);
+REGISTER_KERNEL_BUILDER(Name("_ArrayToList").Device(DEVICE_CPU), PassOn);
+REGISTER_KERNEL_BUILDER(Name("_ArrayToList").Device(DEVICE_GPU), PassOn);
+
 static const FunctionLibraryRuntime::Handle kInvalidHandle = -1;
 
 class FunctionLibraryRuntimeImpl : public FunctionLibraryRuntime {
  public:
   FunctionLibraryRuntimeImpl(Device* device, Runner runner,
                              int graph_def_version,
-                             const FunctionLibraryDefinition* lib_def);
+                             const FunctionLibraryDefinition* lib_def,
+                             const OptimizerOptions& optimizer_options);
 
   ~FunctionLibraryRuntimeImpl() override;
 
@@ -259,7 +224,7 @@ class FunctionLibraryRuntimeImpl : public FunctionLibraryRuntime {
   void Run(const Options& opts, Handle handle, gtl::ArraySlice<Tensor> args,
            std::vector<Tensor>* rets, DoneCallback done) override;
 
-  bool IsDefined(const string& function_name) override;
+  bool IsStateful(const string& function) override;
 
  private:
   typedef FunctionLibraryRuntimeImpl ME;
@@ -268,6 +233,7 @@ class FunctionLibraryRuntimeImpl : public FunctionLibraryRuntime {
   Runner runner_ = nullptr;
   const int graph_def_version_;
   const FunctionLibraryDefinition* const lib_def_;
+  GraphOptimizer optimizer_;
   std::function<Status(const string&, const OpDef**)> get_func_sig_;
   std::function<Status(const NodeDef&, OpKernel**)> create_kernel_;
 
@@ -303,11 +269,13 @@ class FunctionLibraryRuntimeImpl : public FunctionLibraryRuntime {
 
 FunctionLibraryRuntimeImpl::FunctionLibraryRuntimeImpl(
     Device* device, Runner runner, int graph_def_version,
-    const FunctionLibraryDefinition* lib_def)
+    const FunctionLibraryDefinition* lib_def,
+    const OptimizerOptions& optimizer_options)
     : device_(device),
       runner_(runner),
       graph_def_version_(graph_def_version),
-      lib_def_(lib_def) {
+      lib_def_(lib_def),
+      optimizer_(optimizer_options) {
   get_func_sig_ = [this](const string& op, const OpDef** sig) {
     Status s;
     *sig = lib_def_->LookUp(op, &s);
@@ -339,6 +307,7 @@ class CallOp : public AsyncOpKernel {
                       errors::Internal("No function library is provided."),
                       done);
     FunctionLibraryRuntime::Options opts;
+    opts.step_id = ctx->step_id();
     std::vector<Tensor> args;
     args.reserve(ctx->num_inputs());
     for (int i = 0; i < ctx->num_inputs(); ++i) {
@@ -366,41 +335,43 @@ class CallOp : public AsyncOpKernel {
   TF_DISALLOW_COPY_AND_ASSIGN(CallOp);
 };
 
-class SymbolicGradientOp : public OpKernel {
+class SymbolicGradientOp : public AsyncOpKernel {
  public:
   SymbolicGradientOp(OpKernelConstruction* ctx)
-      : OpKernel(ctx), handle_(kInvalidHandle) {}
+      : AsyncOpKernel(ctx), handle_(kInvalidHandle) {}
 
   ~SymbolicGradientOp() override {}
 
-  void Compute(OpKernelContext* ctx) override {
+  void ComputeAsync(OpKernelContext* ctx, DoneCallback done) override {
     FunctionLibraryRuntime* lib = ctx->function_library();
-    OP_REQUIRES(ctx, lib != nullptr,
-                errors::Internal("No function library is provided."));
+    OP_REQUIRES_ASYNC(ctx, lib != nullptr,
+                      errors::Internal("No function library is provided."),
+                      done);
 
-    OP_REQUIRES_OK(ctx, lib->Instantiate(kGradientOp, def().attr(), &handle_));
+    OP_REQUIRES_OK_ASYNC(
+        ctx, lib->Instantiate(kGradientOp, def().attr(), &handle_), done);
 
     FunctionLibraryRuntime::Options opts;
+    opts.step_id = ctx->step_id();
     std::vector<Tensor> args;
     args.reserve(ctx->num_inputs());
     for (int i = 0; i < ctx->num_inputs(); ++i) {
       args.push_back(ctx->input(i));
     }
     std::vector<Tensor>* rets = new std::vector<Tensor>;
-    Notification n;
-    lib->Run(opts, handle_, args, rets, [ctx, rets, &n](const Status& status) {
-      if (!status.ok()) {
-        ctx->SetStatus(status);
-      } else {
-        CHECK_EQ(rets->size(), ctx->num_outputs());
-        for (size_t i = 0; i < rets->size(); ++i) {
-          ctx->set_output(i, (*rets)[i]);
-        }
-      }
-      delete rets;
-      n.Notify();
-    });
-    n.WaitForNotification();
+    lib->Run(opts, handle_, args, rets,
+             [ctx, done, rets](const Status& status) {
+               if (!status.ok()) {
+                 ctx->SetStatus(status);
+               } else {
+                 CHECK_EQ(rets->size(), ctx->num_outputs());
+                 for (size_t i = 0; i < rets->size(); ++i) {
+                   ctx->set_output(i, (*rets)[i]);
+                 }
+               }
+               delete rets;
+               done();
+             });
   }
 
  private:
@@ -416,7 +387,7 @@ REGISTER_KERNEL_BUILDER(Name(kGradientOp).Device(DEVICE_GPU),
 
 const FunctionBody* FunctionLibraryRuntimeImpl::GetFunctionBody(Handle h) {
   mutex_lock l(mu_);
-  CHECK_LE(0, h);
+  CHECK_LE(static_cast<Handle>(0), h);
   CHECK_LT(h, func_graphs_.size());
   return func_graphs_[h];
 }
@@ -436,13 +407,26 @@ Status FunctionLibraryRuntimeImpl::CreateKernel(const NodeDef& ndef,
   const FunctionBody* fbody = GetFunctionBody(handle);
   CHECK_NOTNULL(fbody);
 
+  // TODO(zhifengc): For now, we assume int32 is always on host memory
+  // and other types are always on device memory. We should do type
+  // inference over function body to derive the correct input/output
+  // memory types.
+  MemoryTypeVector input_memory_types;
+  for (const auto& t : fbody->arg_types) {
+    input_memory_types.push_back(t == DT_INT32 ? HOST_MEMORY : DEVICE_MEMORY);
+  }
+  MemoryTypeVector output_memory_types;
+  for (const auto& t : fbody->ret_types) {
+    output_memory_types.push_back(t == DT_INT32 ? HOST_MEMORY : DEVICE_MEMORY);
+  }
+
   // Constructs a CallOp kernel for running the instantiated function.
   Status s;
   auto device_type = DeviceType(device_->attributes().device_type());
   OpKernelConstruction construction(
       device_type, device_, device_->GetAllocator(AllocatorAttributes()), &ndef,
-      &fbody->fdef.signature(), this, fbody->arg_types, fbody->ret_types,
-      graph_def_version_, &s);
+      &fbody->fdef.signature(), this, fbody->arg_types, input_memory_types,
+      fbody->ret_types, output_memory_types, graph_def_version_, &s);
   *kernel = new CallOp(handle, &construction);
   if (!s.ok()) {
     delete kernel;
@@ -541,7 +525,8 @@ Status FunctionLibraryRuntimeImpl::Instantiate(
 
 void DumpGraph(StringPiece label, const Graph* g) {
   // TODO(zhifengc): Change Graph to record #nodes.
-  VLOG(1) << "Graph " << label << " #edges " << g->edges().size();
+  VLOG(1) << "Graph " << label << " #nodes " << g->num_nodes() << " #edges "
+          << g->edges().size();
   if (VLOG_IS_ON(2)) {
     for (const auto& line : str_util::Split(DebugString(g), '\n')) {
       VLOG(2) << "|| " << line;
@@ -549,54 +534,13 @@ void DumpGraph(StringPiece label, const Graph* g) {
   }
 }
 
-static void SimplifyGraph(Graph* g) {
-  if (RemoveListArrayConverter(g)) {
-    DumpGraph("RemoveListArrayConverter", g);
-  }
-  bool changed;
-  do {
-    changed = false;
-    if (RemoveDeadNodes(g)) {
-      changed = true;
-      DumpGraph("RemoveDeadNodes", g);
-    }
-    if (RemoveIdentityNodes(g)) {
-      changed = true;
-      DumpGraph("RemoveIdentityNodes", g);
-    }
-    FixupSourceAndSinkEdges(g);
-    OptimizeCSE(g, nullptr);
-    DumpGraph("OptimizeCSE", g);
-  } while (changed);
-}
-
 void OptimizeGraph(FunctionLibraryRuntime* lib, Graph** g) {
-  for (const Node* n : (*g)->nodes()) {
-    if (n->IsControlFlow()) {
-      VLOG(2) << "Skip OptimizeGraph due to control flow ops.";
-      return;
-    }
-  }
-
-  DumpGraph("Initial", *g);
-
-  // Run SimplifyGraph at least once to rewrite away ops such as
-  // _ListToArray, _ArrayToList, etc.
-  SimplifyGraph(*g);
-
-  const int kNumInlineRounds = 10;
-  for (int i = 0; i < kNumInlineRounds; ++i) {
-    if (!ExpandInlineFunctions(lib, *g)) break;
-    DumpGraph("ExpandInlineFunctions", *g);
-    SimplifyGraph(*g);
-  }
-
-  // Makes a copy so that we densify node ids.
-  Graph* copy = new Graph((*g)->op_registry());
-  CopyGraph(**g, copy);
-  delete *g;
-  *g = copy;
-  DumpGraph("ReCopy", *g);
+  OptimizerOptions opts;
+  opts.set_do_common_subexpression_elimination(true);
+  opts.set_do_function_inlining(true);
+  opts.set_do_constant_folding(true);
+  GraphOptimizer optimizer(opts);
+  optimizer.Optimize(lib, g);
 }
 
 Status FunctionLibraryRuntimeImpl::CreateItem(Handle handle, Item** item) {
@@ -604,7 +548,8 @@ Status FunctionLibraryRuntimeImpl::CreateItem(Handle handle, Item** item) {
   CHECK_NOTNULL(fbody);
   Graph* g = new Graph(lib_def_);
   CopyGraph(*fbody->graph, g);
-  OptimizeGraph(this, &g);
+
+  optimizer_.Optimize(this, &g);
 
   // Creates an executor based on the g.  This must be done without
   // holding mu_ because create_kernel_ calls back into the library.
@@ -673,6 +618,8 @@ void FunctionLibraryRuntimeImpl::Run(const Options& opts, Handle handle,
     return done(s);
   }
   Executor::Args exec_args;
+  // Inherit the step_id from the caller.
+  exec_args.step_id = opts.step_id;
   exec_args.call_frame = frame;
   exec_args.cancellation_manager = opts.cancellation_manager;
   exec_args.runner = runner_;
@@ -691,18 +638,22 @@ void FunctionLibraryRuntimeImpl::Run(const Options& opts, Handle handle,
       });
 }
 
-bool FunctionLibraryRuntimeImpl::IsDefined(const string& function_name) {
-  return lib_def_->Find(function_name) != nullptr;
+bool FunctionLibraryRuntimeImpl::IsStateful(const string& func) {
+  Status s;
+  auto sig = lib_def_->LookUp(func, &s);
+  return s.ok() && sig->is_stateful();
 }
 
 FunctionLibraryRuntime* NewFunctionLibraryRuntime(
     Device* device, Runner runner, int graph_def_version,
-    const FunctionLibraryDefinition* lib_def) {
+    const FunctionLibraryDefinition* lib_def,
+    const OptimizerOptions& optimizer_options) {
   return new FunctionLibraryRuntimeImpl(device, runner, graph_def_version,
-                                        lib_def);
+                                        lib_def, optimizer_options);
 }
 
 bool RemoveDeadNodes(Graph* g) {
+  VLOG(2) << "Removing dead nodes";
   std::vector<bool> visited(g->num_node_ids(), false);
   std::deque<Node*> q;
   for (auto n : g->nodes()) {
@@ -742,7 +693,15 @@ namespace {
 const Edge* GetTheOnlyDataEdge(const EdgeSet& edges) {
   const Edge* ret = nullptr;
   for (const Edge* e : edges) {
-    if (e->IsControlEdge() || ret) return nullptr;
+    if (e->IsControlEdge() || ret) {
+      // Don't touch it if there is a control edge.
+      return nullptr;
+    }
+    if (IsRefType(e->src()->output_type(e->src_output()))) {
+      // Don't touch it if the identity node is effectively de-reffing
+      // a ref.
+      return nullptr;
+    }
     ret = e;
   }
   return ret;
@@ -750,10 +709,11 @@ const Edge* GetTheOnlyDataEdge(const EdgeSet& edges) {
 }  // end namespace
 
 bool RemoveIdentityNodes(Graph* g) {
+  VLOG(2) << "Removing identity nodes";
   bool removed_any = false;
   gtl::InlinedVector<Node*, 8> matches;
   for (Node* n : g->nodes()) {
-    if ((n->IsIdentity()) && GetTheOnlyDataEdge(n->in_edges())) {
+    if (n->IsIdentity() && GetTheOnlyDataEdge(n->in_edges())) {
       matches.push_back(n);
     }
   }
@@ -767,6 +727,7 @@ bool RemoveIdentityNodes(Graph* g) {
           g->AddEdge(in->src(), in->src_output(), out->dst(), out->dst_input());
         }
       }
+      VLOG(2) << "Remove Identity: " << n->DebugString();
       g->RemoveNode(n);
       removed_any = true;
     }
@@ -775,6 +736,7 @@ bool RemoveIdentityNodes(Graph* g) {
 }
 
 bool RemoveListArrayConverter(Graph* g) {
+  VLOG(2) << "Removing list array converter";
   gtl::InlinedVector<Node*, 8> matches;
   for (Node* n : g->nodes()) {
     if ((n->type_string() == "_ListToArray") ||
@@ -904,10 +866,14 @@ static void InlineFunctionBody(Graph* g, Node* caller,
   // If 'x' is a node in fbody->graph and its copy in 'g' is 'y', we
   // remember 'y' in node_map[x->id()].
   std::vector<Node*> node_map(fbody->graph->num_node_ids());
+  Status s;
   for (Node* n : fbody->graph->nodes()) {
     if (n->IsSource() || n->IsSink()) continue;
     CHECK(n->IsOp());
-    node_map[n->id()] = g->CopyNode(n);
+    NodeDef ndef = n->def();
+    ndef.set_name(strings::StrCat(caller->name(), "/", ndef.name()));
+    node_map[n->id()] = g->AddNode(ndef, &s);
+    TF_CHECK_OK(s);
   }
   for (const Edge* e : fbody->graph->edges()) {
     if (e->src()->IsSource() || e->src()->IsSink() || e->dst()->IsSource() ||
@@ -1152,40 +1118,8 @@ class SymbolicGradientHelper {
   const FunctionBody* fbody_;
   FunctionBody* gbody_ = nullptr;
 
-  // A vector of output endpoints which represents backpropagated
-  // gradients
-  typedef std::vector<Endpoint> BackpropedGradients;
-
-  // backprops_ is a map from an output endpoint to its accumulated
-  // gradients.  When an output endpoint has accumulated all its
-  // gradients, we add a node which sums them up.
-  std::unordered_map<Endpoint, BackpropedGradients, EndpointHash, EndpointEq>
-      backprops_;
-
-  // pending[i] is count-down counter for i-th node's expected
-  // backprops.  When pending[i] becomes zero, we collected all
-  // backprop gradients for all output endpoint of the ith-node.
-  std::vector<int> pending_;
-
-  // 'ready' keeps track of nodes that have been completely
-  // backpropped. Initially, for every output y of the function f, we
-  // add dy as an input of the gradient function.
-  std::deque<Node*> ready_;
-
   // Makes a copy of fbody_ in gbody_.
   void Copy();
-
-  // Initialize pending_ and ready_.
-  void InitBackprop();
-
-  // In the original function body, there is a forward edge from 'src'
-  // to 'dst', when the backprop algorithm constructs the node
-  // 'dst_grad' which computes the gradient, we need to propagate it
-  // to 'src'.
-  void BackpropAlongEdge(const Endpoint& dst_grad, const Endpoint& src);
-  void BackpropZerosAlongEdge(const Endpoint& src);
-
-  Endpoint SumGradients(const Endpoint& src);
 
   TF_DISALLOW_COPY_AND_ASSIGN(SymbolicGradientHelper);
 };
@@ -1228,127 +1162,6 @@ void SymbolicGradientHelper::Copy() {
   }
 }
 
-void SymbolicGradientHelper::BackpropAlongEdge(const Endpoint& dst_grad,
-                                               const Endpoint& src) {
-  CHECK_NOTNULL(src.node);
-  auto iter = backprops_.find(src);
-  if (iter != backprops_.end()) {
-    auto* grads = &iter->second;
-    grads->push_back(dst_grad);
-    if (--pending_[src.node->id()] == 0) {
-      ready_.push_back(src.node);
-    }
-  }
-}
-
-void SymbolicGradientHelper::BackpropZerosAlongEdge(const Endpoint& src) {
-  CHECK_NOTNULL(src.node);
-  auto iter = backprops_.find(src);
-  if (iter != backprops_.end()) {
-    if (--pending_[src.node->id()] == 0) {
-      ready_.push_back(src.node);
-    }
-  }
-}
-
-void SymbolicGradientHelper::InitBackprop() {
-  Graph* g = gbody_->graph;
-  pending_.resize(g->num_node_ids(), 0);
-  {
-    backprops_.clear();
-    std::unordered_set<Node*> visited;
-    std::deque<Node*> queue;
-    for (Node* n : gbody_->arg_nodes) {
-      queue.push_back(n);
-    }
-
-    // Going forward to figure out which endpoints need backprop-ed.
-    // A node's endpoints need to be backprop-ed only if one of the
-    // arg node can reach the node via data edges.
-    while (!queue.empty()) {
-      Node* n = queue.front();
-      queue.pop_front();
-      visited.insert(n);
-      for (int i = 0; i < n->num_outputs(); ++i) {
-        backprops_[{n, i}].clear();
-      }
-      int num_expected_backprops = 0;
-      for (const Edge* e : n->out_edges()) {
-        if (e->IsControlEdge()) continue;
-        ++num_expected_backprops;
-        if (visited.find(e->dst()) == visited.end()) {
-          queue.push_back(e->dst());
-        }
-      }
-      pending_[n->id()] = num_expected_backprops;
-    }
-  }
-
-  {
-    const int num_y = gbody_->ret_nodes.size();
-    for (int i = 0; i < num_y; ++i) {
-      Node* y = gbody_->ret_nodes[i];
-      DCHECK_EQ(y->type_string(), kRetOp);
-      const DataType dtype = y->input_type(0);
-      const int index = gbody_->arg_nodes.size();
-      Node* dy = AddArg(g, dtype, index);
-      gbody_->arg_types.push_back(dtype);
-      gbody_->arg_nodes.push_back(dy);
-
-      // What's the input to y?
-      Endpoint y_in{nullptr, 0};
-      for (const Edge* e : y->in_edges()) {
-        if (!e->IsControlEdge()) {
-          y_in = {e->src(), e->src_output()};
-          break;
-        }
-      }
-      CHECK_NOTNULL(y_in.node);
-      BackpropAlongEdge({dy, 0}, y_in);
-    }
-  }
-}
-
-Endpoint SymbolicGradientHelper::SumGradients(const Endpoint& src) {
-  Graph* g = gbody_->graph;
-  const DataType dtype = src.dtype();
-  auto iter = backprops_.find(src);
-  CHECK(iter != backprops_.end());
-  const auto& grads = iter->second;
-  if (grads.empty()) {
-    // Nothing propagated back. The best we can come up is zeros.
-    Node* zero_like = AddZerosLike(g, src);
-    return {zero_like, 0};
-  }
-  if (grads.size() == 1) {
-    // Just one backprop edge.
-    return grads[0];
-  }
-  // Otherwise, adds backprop-ed gradients.
-  NodeDef ndef;
-  ndef.set_name(g->NewName(kNodeLabel));
-  ndef.set_op("AddN");  // N-way Add
-  for (const Endpoint& ep : grads) {
-    ndef.add_input(ep.name());
-  }
-  AddNodeAttr("N", static_cast<int64>(grads.size()), &ndef);
-  AddNodeAttr("T", dtype, &ndef);
-  Status s;
-  Node* add = gbody_->graph->AddNode(ndef, &s);
-  TF_CHECK_OK(s);
-  for (size_t i = 0; i < grads.size(); ++i) {
-    const Endpoint& ep = grads[i];
-    g->AddEdge(ep.node, ep.index, add, i);
-  }
-  return {add, 0};
-}
-
-static bool IsPrimitiveOpWithNoGrad(const string& func) {
-  gradient::Creator creator;
-  Status s = gradient::GetOpGradientCreator(func, &creator);
-  return s.ok() && (creator == nullptr);
-}
-
 FunctionBody* SymbolicGradientHelper::Compute() {
   CHECK(gbody_ == nullptr);
   gbody_ = new FunctionBody;
@@ -1356,69 +1169,49 @@ FunctionBody* SymbolicGradientHelper::Compute() {
   // Copy fbody_ into gbody_.
   Copy();
 
-  // Initialize backprops.
-  InitBackprop();
-
-  // Backward propagation.
-  gtl::InlinedVector<Endpoint, 8> dy;
   Graph* g = gbody_->graph;
-  while (!ready_.empty()) {
-    // n has collected all gradients.
-    Node* n = ready_.front();
-    ready_.pop_front();
-
-    if (n->type_string() == kArgOp) {
-      // We'll handle the _Arg node after backprop is done.
-      continue;
-    }
-
-    // "n" has num_x inputs and num_y outputs.
-    const int num_x = n->num_inputs();
-    const int num_y = n->num_outputs();
-
-    // dy[i] is the sum of i-th output's backpropped gradients.
-    dy.clear();
-    dy.resize(num_y, {nullptr, 0});
-    for (int i = 0; i < num_y; ++i) {
-      dy[i] = SumGradients({n, i});
-    }
-
-    if (IsPrimitiveOpWithNoGrad(n->type_string())) {
-      // No grad defined for this op.  Backprops zeros along the in
-      // edges.
-      for (const Edge* e : n->in_edges()) {
-        if (e->IsControlEdge()) continue;
-        BackpropZerosAlongEdge({e->src(), e->src_output()});
-      }
-      continue;
-    }
-
-    // Adds a gradient node with num_x + num_y inputs and num_x
-    // outputs.
-    Node* grad = AddSymGrad(g, n, dy);
-    for (const Edge* e : n->in_edges()) {
-      if (e->IsControlEdge()) continue;
-      g->AddEdge(e->src(), e->src_output(), grad, e->dst_input());
-    }
-    for (int i = 0; i < num_y; ++i) {
-      g->AddEdge(dy[i].node, dy[i].index, grad, num_x + i);
-    }
-
-    // Backprops along the in edges.
-    for (const Edge* e : n->in_edges()) {
-      if (e->IsControlEdge()) continue;
-      BackpropAlongEdge({grad, e->dst_input()}, {e->src(), e->src_output()});
-    }
+  // Populate 'y_grad_nodes' with initial gradient nodes for each return node of
+  // the original function body (these will be 'arg' nodes in the function
+  // gradient body).
+  const int num_y = gbody_->ret_nodes.size();
+  std::vector<Node*> y_grad_nodes;
+  y_grad_nodes.reserve(num_y);
+  for (int i = 0; i < num_y; ++i) {
+    Node* y = gbody_->ret_nodes[i];
+    DCHECK_EQ(y->type_string(), kRetOp);
+    const DataType dtype = y->input_type(0);
+    const int index = gbody_->arg_nodes.size();
+    Node* dy = AddArg(g, dtype, index);
+    gbody_->arg_types.push_back(dtype);
+    gbody_->arg_nodes.push_back(dy);
+    y_grad_nodes.push_back(dy);
   }
 
-  // The gradient's retval nodes.
+  // Populate 'x_nodes' with function args (not including 'y_grad_nodes').
+  const int num_x = fbody_->arg_nodes.size();
+  std::vector<Node*> x_nodes;
+  x_nodes.reserve(num_x);
+  for (size_t i = 0; i < fbody_->arg_nodes.size(); ++i) {
+    x_nodes.push_back(gbody_->arg_nodes[i]);
+  }
+
+  // Call AddSymbolicGradients which will add nodes to graph 'g' that
+  // compute the function gradient (adding an entry in 'x_grad_nodes' for
+  // each node in 'x_nodes').
+  std::vector<GradNodeOutput> x_grad_nodes(x_nodes.size());
+  TF_CHECK_OK(AddSymbolicGradients(gbody_->ret_nodes, x_nodes, y_grad_nodes,
+                                   &x_grad_nodes, g));
+
+  // Remove the old return nodes from the function body.
   for (Node* n : gbody_->ret_nodes) {
     g->RemoveNode(n);
   }
   gbody_->ret_types = fbody_->arg_types;
   gbody_->ret_nodes.clear();
+  // Add new return nodes to the function gradient body for each node
+  // in 'x_grad_nodes'.
   for (size_t i = 0; i < fbody_->arg_types.size(); ++i) {
-    Endpoint grad = SumGradients({gbody_->arg_nodes[i], 0});
+    Endpoint grad = {x_grad_nodes[i].node, x_grad_nodes[i].index};
     Node* ret = AddRet(g, grad, i);
     gbody_->ret_nodes.push_back(ret);
   }

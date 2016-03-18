@@ -156,9 +156,14 @@ def _SplitGrad(op, *grads):
 
 ops.NoGradient("Const")
 
-# TODO(liqzhang): The gradient for Diag operator would be
-# the diagonal of the backprop. Implement if there is a need.
-ops.NoGradient("Diag")
+
+@ops.RegisterGradient("Diag")
+def _DiagGrad(_, grad):
+  return array_ops.diag_part(grad)
+
+@ops.RegisterGradient("DiagPart")
+def _DiagPartGrad(_, grad):
+  return array_ops.diag(grad)
 
 # Edit Distance has no gradient (but can be used to eval seq2seq or CTC).
 ops.NoGradient("EditDistance")
@@ -169,12 +174,19 @@ def _FillGrad(_, grad):
   return None, math_ops.reduce_sum(grad)
 
 
+ops.NoGradient("ZerosLike")
+
+
 @ops.RegisterGradient("Gather")
 def _GatherGrad(op, grad):
-  # op.inputs[0] can be large, so colocate the shape calculation with it.
-  with ops.device(op.inputs[0].device):
-    dense_shape = array_ops.shape(op.inputs[0])
-    values_shape = array_ops.concat(0, [[-1], dense_shape[1:]])
+  if op.inputs[0].get_shape().is_fully_defined():
+    dense_shape = constant_op.constant(op.inputs[0].get_shape().as_list())
+    values_shape = [-1] + op.inputs[0].get_shape()[1:].as_list()
+  else:
+    # op.inputs[0] can be large, so colocate the shape calculation with it.
+    with ops.colocate_with(op.inputs[0]):
+      dense_shape = array_ops.shape(op.inputs[0])
+      values_shape = array_ops.concat(0, [[-1], dense_shape[1:]])
 
   values = array_ops.reshape(grad, values_shape)
   indices = array_ops.reshape(op.inputs[1], [-1])
@@ -295,3 +307,36 @@ def _ReverseSequenceGrad(op, grad):
 def _ReverseGrad(op, grad):
   reverse_dims = op.inputs[1]
   return array_ops.reverse(grad, reverse_dims), None
+
+
+@ops.RegisterGradient("SpaceToDepth")
+def _SpaceToDepthGrad(op, grad):
+  # Its gradient is the opposite op: DepthToSpace.
+  block_size = op.get_attr("block_size")
+  return array_ops.depth_to_space(grad, block_size)
+
+
+@ops.RegisterGradient("DepthToSpace")
+def _DepthToSpaceGrad(op, grad):
+  # Its gradient is the opposite op: SpaceToDepth.
+  block_size = op.get_attr("block_size")
+  return array_ops.space_to_depth(grad, block_size)
+
+
+ops.NoGradient("OneHot")
+
+
+@ops.RegisterGradient("MirrorPad")
+def _MirrorPadGrad(op, grad):
+  mode = op.get_attr("mode")
+  # pylint: disable=protected-access
+  return [gen_array_ops._mirror_pad_grad(grad, op.inputs[1], mode=mode), None]
+  # pylint: enable=protected-access
+
+
+@ops.RegisterGradient("MirrorPadGrad")
+def _MirrorPadGradGrad(op, grad):
+  mode = op.get_attr("mode")
+  # pylint: disable=protected-access
+  return [gen_array_ops._mirror_pad(grad, op.inputs[1], mode=mode), None]
+  # pylint: enable=protected-access

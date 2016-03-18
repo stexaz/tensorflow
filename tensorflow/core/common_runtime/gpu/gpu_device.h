@@ -51,7 +51,7 @@ class BaseGPUDevice : public LocalDevice {
   // GPU devices require the Op Compute method to save a reference to
   // any temporary tensors that are allocated until the Op execution
   // completes.
-  bool RequiresRecordingAccessedTensors() const override { return true; }
+  bool RequiresRecordingAccessedTensors() const override;
 
   void ConsumeListOfAccessedTensors(
       DeviceContext* device_context,
@@ -74,15 +74,21 @@ class BaseGPUDevice : public LocalDevice {
   // The caller owns the returned device.
   PerOpGpuDevice* MakeGpuDevice() override;
 
-  void ReinitializeGpuDevice(PerOpGpuDevice* device, DeviceContext* dc,
-                             Allocator* allocator) override;
+  void ReinitializeGpuDevice(OpKernelContext* context, PerOpGpuDevice* device,
+                             DeviceContext* dc, Allocator* allocator) override;
 
  protected:
   Allocator* gpu_allocator_;  // not owned
   Allocator* cpu_allocator_;  // not owned
 
  private:
-  std::vector<gpu::Stream*> streams_;
+  struct StreamGroup {
+    gpu::Stream* compute;
+    gpu::Stream* host_to_device;
+    gpu::Stream* device_to_host;
+    gpu::Stream* device_to_device;
+  };
+  gtl::InlinedVector<StreamGroup, 4> streams_;
   std::vector<GPUDeviceContext*> device_contexts_;
   GpuDeviceInfo* gpu_device_info_ = nullptr;
   mutex trace_mu_;
@@ -90,8 +96,8 @@ class BaseGPUDevice : public LocalDevice {
   const bool sync_every_op_ = false;
   std::unique_ptr<EventMgr> em_;
 
-  void ReinitializeDevice(PerOpGpuDevice* device, int stream_id,
-                          Allocator* allocator);
+  void ReinitializeDevice(OpKernelContext* context, PerOpGpuDevice* device,
+                          int stream_id, Allocator* allocator);
 };
 
 class BaseGPUDeviceFactory : public DeviceFactory {

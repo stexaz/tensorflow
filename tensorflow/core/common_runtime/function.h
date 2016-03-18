@@ -21,6 +21,7 @@ limitations under the License.
 #include "tensorflow/core/common_runtime/device.h"
 #include "tensorflow/core/framework/function.h"
 #include "tensorflow/core/graph/graph.h"
+#include "tensorflow/core/protobuf/config.pb.h"
 
 namespace tensorflow {
 
@@ -34,7 +35,8 @@ typedef std::function<void()> Closure;
 typedef std::function<void(Closure)> Runner;
 FunctionLibraryRuntime* NewFunctionLibraryRuntime(
     Device* device, Runner runner, int graph_def_version,
-    const FunctionLibraryDefinition* lib_def);
+    const FunctionLibraryDefinition* lib_def,
+    const OptimizerOptions& optimizer_options);
 
 // FunctionLibraryRuntime::GetFunctionBody returns a description of an
 // instantiated function that is represented as a Graph with arg/ret

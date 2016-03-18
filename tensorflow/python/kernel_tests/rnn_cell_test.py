@@ -15,19 +15,35 @@
 
 """Tests for RNN cells."""
 
-# pylint: disable=g-bad-import-order,unused-import
 from __future__ import absolute_import
 from __future__ import division
 from __future__ import print_function
 
-import tensorflow.python.platform
-
 import numpy as np
-from six.moves import xrange  # pylint: disable=redefined-builtin
 import tensorflow as tf
 
 
 class RNNCellTest(tf.test.TestCase):
+
+  def testLinear(self):
+    with self.test_session() as sess:
+      with tf.variable_scope("root", initializer=tf.constant_initializer(1.0)):
+        x = tf.zeros([1, 2])
+        l = tf.nn.rnn_cell.linear([x], 2, False)
+        sess.run([tf.initialize_all_variables()])
+        res = sess.run([l], {x.name: np.array([[1., 2.]])})
+        self.assertAllClose(res[0], [[3.0, 3.0]])
+
+        # Checks prevent you from accidentally creating a shared function.
+        with self.assertRaises(ValueError):
+          l1 = tf.nn.rnn_cell.linear([x], 2, False)
+
+        # But you can create a new one in a new scope and share the variables.
+        with tf.variable_scope("l1") as new_scope:
+          l1 = tf.nn.rnn_cell.linear([x], 2, False)
+        with tf.variable_scope(new_scope, reuse=True):
+          tf.nn.rnn_cell.linear([l1], 2, False)
+        self.assertEqual(len(tf.trainable_variables()), 2)
 
   def testBasicRNNCell(self):
     with self.test_session() as sess:
@@ -99,7 +115,8 @@ class RNNCellTest(tf.test.TestCase):
         x = tf.zeros([batch_size, input_size])
         m = tf.zeros([batch_size, state_size])
         output, state = tf.nn.rnn_cell.LSTMCell(
-            num_units=num_units, input_size=input_size, num_proj=num_proj)(x, m)
+            num_units=num_units, input_size=input_size, 
+            num_proj=num_proj, forget_bias=1.0)(x, m)
         sess.run([tf.initialize_all_variables()])
         res = sess.run([output, state],
                        {x.name: np.array([[1., 1.], [2., 2.], [3., 3.]]),

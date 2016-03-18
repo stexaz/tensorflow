@@ -18,8 +18,6 @@ from __future__ import absolute_import
 from __future__ import division
 from __future__ import print_function
 
-import tensorflow.python.platform
-
 from tensorflow.core.framework import tensor_shape_pb2
 
 
@@ -413,10 +411,13 @@ class TensorShape(object):
     if dims is None:
       self._dims = None
     elif isinstance(dims, tensor_shape_pb2.TensorShapeProto):
-      self._dims = [
-          # Protos store variable-size dimensions as -1
-          as_dimension(dim.size if dim.size != -1 else None)
-          for dim in dims.dim]
+      if dims.unknown_rank:
+        self._dims = None
+      else:
+        self._dims = [
+            # Protos store variable-size dimensions as -1
+            as_dimension(dim.size if dim.size != -1 else None)
+            for dim in dims.dim]
     else:
       try:
         dims_iter = iter(dims)
@@ -741,10 +742,13 @@ class TensorShape(object):
 
   def as_proto(self):
     """Returns this shape as a `TensorShapeProto`."""
-    return tensor_shape_pb2.TensorShapeProto(dim=[
-        tensor_shape_pb2.TensorShapeProto.Dim(
-            size=-1 if d.value is None else d.value)
-        for d in self._dims])
+    if self._dims is None:
+      return tensor_shape_pb2.TensorShapeProto(unknown_rank=True)
+    else:
+      return tensor_shape_pb2.TensorShapeProto(dim=[
+          tensor_shape_pb2.TensorShapeProto.Dim(
+              size=-1 if d.value is None else d.value)
+          for d in self._dims])
 
   def __eq__(self, other):
     """Returns True if `self` is equivalent to `other`."""

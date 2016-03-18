@@ -42,6 +42,9 @@ void OpRegistry::Register(const OpDef& op_def) {
   } else {
     deferred_.push_back(op_def);
   }
+  if (watcher_) {
+    watcher_(op_def);
+  }
 }
 
 const OpDef* OpRegistry::LookUp(const string& op_type_name,
@@ -55,7 +58,7 @@ const OpDef* OpRegistry::LookUp(const string& op_type_name,
     // Note: Can't hold mu_ while calling Export() below.
   }
   if (first_call) {
-    TF_QCHECK_OK(ValidateKernelRegistrations(this));
+    TF_QCHECK_OK(ValidateKernelRegistrations(*this));
   }
   if (op_def == nullptr) {
     status->Update(
@@ -81,6 +84,16 @@ void OpRegistry::GetRegisteredOps(std::vector<OpDef>* op_defs) {
   for (auto p : registry_) {
     op_defs->push_back(*p.second);
   }
+}
+
+Status OpRegistry::SetWatcher(const Watcher& watcher) {
+  mutex_lock lock(mu_);
+  if (watcher_ && watcher) {
+    return errors::AlreadyExists(
+        "Cannot over-write a valid watcher with another.");
+  }
+  watcher_ = watcher;
+  return Status::OK();
 }
 
 void OpRegistry::Export(bool include_internal, OpList* ops) const {
@@ -141,6 +154,27 @@ OpRegistry* OpRegistry::Global() {
   return global_op_registry;
 }
 
+// OpListOpRegistry -----------------------------------------------------------
+
+OpListOpRegistry::OpListOpRegistry(const OpList* op_list) {
+  for (const OpDef& op_def : op_list->op()) {
+    index_[op_def.name()] = &op_def;
+  }
+}
+
+const OpDef* OpListOpRegistry::LookUp(const string& op_type_name,
+                                      Status* status) const {
+  auto iter = index_.find(op_type_name);
+  if (iter == index_.end()) {
+    status->Update(
+        errors::NotFound("Op type not registered '", op_type_name, "'"));
+    return nullptr;
+  }
+  return iter->second;
+}
+
+// Other registration ---------------------------------------------------------
+
 namespace register_op {
 OpDefBuilderReceiver::OpDefBuilderReceiver(const OpDefBuilder& builder) {
   OpDef op_def;
@@ -148,20 +182,5 @@ OpDefBuilderReceiver::OpDefBuilderReceiver(const OpDefBuilder& builder) {
   OpRegistry::Global()->Register(op_def);
 }
 }  // namespace register_op
-
-extern "C" void RegisterOps(void* registry_ptr) {
-  OpRegistry* op_registry = static_cast<OpRegistry*>(registry_ptr);
-  std::vector<OpDef> op_defs;
-  OpRegistry::Global()->GetRegisteredOps(&op_defs);
-  for (auto const& op_def : op_defs) {
-    op_registry->Register(op_def);
-  }
-}
-
-extern "C" void GetOpList(void* str) {
-  OpList op_list;
-  OpRegistry::Global()->Export(true, &op_list);
-  op_list.SerializeToString(reinterpret_cast<string*>(str));
-}
 
 }  // namespace tensorflow
